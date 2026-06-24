@@ -24,4 +24,6 @@ pub enum VaultError {
     PositionNotFound = 17,
     /// Caller or beneficiary is not whitelisted while whitelist is enabled.
     NotWhitelisted = 18,
+    /// Unstake must use request_unstake / execute_unstake flow when cooldown is enabled.
+    UseCooldownFlow = 19,
 }

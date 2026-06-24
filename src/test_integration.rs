@@ -911,3 +911,128 @@ fn test_initialization_defaults_treasury_to_admin() {
     vault.slash(&admin, &alice, &10_000).unwrap();
     assert_eq!(token.balance(&admin), 10_000);
 }
+
+// ── cooldown / unbonding flow tests ─────────────────────────────────────────
+
+#[test]
+fn test_full_cooldown_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| { li.sequence_number = 0; li.min_persistent_entry_ttl = 1_000_000; li.max_entry_ttl = 1_000_000; });
+
+    let admin = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let (token_addr, token, token_admin) = create_token(&env, &admin);
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+    vault.initialize(&admin, &token_addr);
+
+    // set cooldown to 5 ledgers
+    vault.set_cooldown_period(&admin, &5);
+
+    token_admin.mint(&alice, &200_000);
+    vault.stake(&alice, &100_000);
+
+    // request unstake 50_000
+    vault.request_unstake(&alice, &50_000).unwrap();
+
+    // pending unbonding should be present
+    let pos = vault.pending_unbonding(&alice).unwrap().unwrap();
+    assert_eq!(pos.amount, 50_000);
+
+    // advance ledger past cooldown
+    env.ledger().with_mut(|li| li.sequence_number = 6);
+
+    // execute unstake
+    let executed = vault.execute_unstake(&alice).unwrap();
+    assert_eq!(executed, 50_000);
+
+    // alice balance: minted 200k - staked 100k + executed 50k = 150k
+    assert_eq!(token.balance(&alice), 150_000);
+}
+
+#[test]
+fn test_premature_execute_unstake_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| { li.sequence_number = 0; li.min_persistent_entry_ttl = 1_000_000; li.max_entry_ttl = 1_000_000; });
+
+    let admin = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let (token_addr, _token, token_admin) = create_token(&env, &admin);
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+    vault.initialize(&admin, &token_addr);
+
+    vault.set_cooldown_period(&admin, &10);
+    token_admin.mint(&alice, &100_000);
+    vault.stake(&alice, &50_000);
+
+    vault.request_unstake(&alice, &20_000).unwrap();
+
+    // attempt to execute immediately -> should fail
+    let res = vault.try_execute_unstake(&alice);
+    assert_eq!(res, Err(Ok(crate::errors::VaultError::UseCooldownFlow)));
+}
+
+#[test]
+fn test_zero_cooldown_bypass_allows_instant_unstake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| { li.sequence_number = 0; li.min_persistent_entry_ttl = 1_000_000; li.max_entry_ttl = 1_000_000; });
+
+    let admin = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let (token_addr, token, token_admin) = create_token(&env, &admin);
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+    vault.initialize(&admin, &token_addr);
+
+    // set cooldown to 0
+    vault.set_cooldown_period(&admin, &0);
+
+    token_admin.mint(&alice, &100_000);
+    vault.stake(&alice, &50_000);
+
+    // instant unstake allowed
+    let returned = vault.unstake(&alice, &50_000);
+    assert_eq!(returned, 50_000);
+    assert_eq!(token.balance(&alice), 100_000);
+}
+
+#[test]
+fn test_no_rewards_accrued_during_cooldown() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| { li.sequence_number = 0; li.min_persistent_entry_ttl = 1_000_000; li.max_entry_ttl = 1_000_000; });
+
+    let admin = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let (token_addr, _token, token_admin) = create_token(&env, &admin);
+    let vault_id = env.register_contract(None, VaultContract);
+    let vault = VaultContractClient::new(&env, &vault_id);
+    vault.initialize(&admin, &token_addr);
+
+    // set cooldown
+    vault.set_cooldown_period(&admin, &10);
+
+    token_admin.mint(&alice, &500_000);
+    vault.stake(&alice, &100_000);
+
+    // advance ledger to accrue some rewards
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    vault.set_reward_rate_bps(&1000);
+
+    let pending_before = vault.calc_pending_reward(&alice).unwrap();
+    assert!(pending_before > 0);
+
+    // request unstake full amount
+    vault.request_unstake(&alice, &100_000).unwrap();
+
+    // advance further during cooldown
+    env.ledger().with_mut(|li| li.sequence_number = 200);
+
+    // claim should return only the accrued before request_unstake (no new accrual on unbonding principal)
+    let claim_after = vault.claim(&alice);
+    assert_eq!(claim_after, pending_before);
+}

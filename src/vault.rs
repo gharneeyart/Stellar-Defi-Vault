@@ -2,7 +2,7 @@ use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
 
 use crate::{
     admin, balance, errors::VaultError, events,
-    storage::{DataKey, PoolStats, UserStats},
+    storage::{DataKey, PoolStats, UserStats, UnbondingPosition},
 };
 
 pub(crate) const BOOST_BPS_BASE: u32 = 10_000;
@@ -251,6 +251,152 @@ impl VaultContract {
         let admin = admin::get_admin(&env)?;
         events::withdrawal_limit_updated(&env, &admin, limit);
         Ok(())
+    }
+
+    /// Admin: set the unbonding cooldown period in ledgers. 0 disables cooldown (instant unstake allowed).
+    pub fn set_cooldown_period(env: Env, ledgers: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::CooldownPeriod, &ledgers);
+        Ok(())
+    }
+
+    /// User-visible: request an unstake which starts the cooldown. The requested amount is removed from active stake and placed into an unbonding position.
+    pub fn request_unstake(env: Env, user: Address, amount: i128) -> Result<(), VaultError> {
+        user.require_auth();
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        // If cooldown is zero, user can call instant unstake directly — we still allow request_unstake to perform instant withdrawal for convenience
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+        let user_shares = balance::get_shares(&env, &user);
+        if user_shares == 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        // compute user's current token-equivalent position
+        let position_amount = balance::shares_to_amount(total_shares, total_deposited, user_shares)
+            .ok_or(VaultError::ArithmeticError)?;
+        if position_amount <= 0 {
+            return Err(VaultError::PositionNotFound);
+        }
+
+        // ensure requested amount <= position_amount
+        let actual_amount = if amount > position_amount { position_amount } else { amount };
+
+        // Crucial: finalize reward accrual up to now so that rewards on the to-be-unbonded principal stop accruing afterwards
+        Self::accrue_rewards(&env, &user, user_shares)?;
+
+        // compute shares to remove corresponding to actual_amount
+        let mut shares_to_remove = balance::amount_to_shares(total_shares, total_deposited, actual_amount)
+            .unwrap_or(user_shares);
+        if shares_to_remove > user_shares {
+            shares_to_remove = user_shares;
+        }
+
+        // compute concrete amount removed based on shares_to_remove (rounding-safe)
+        let amount_removed = balance::shares_to_amount(total_shares, total_deposited, shares_to_remove)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        // update user shares and totals immediately; funds remain in contract until execute_unstake
+        let new_user_shares = user_shares - shares_to_remove;
+        balance::set_shares(&env, &user, new_user_shares);
+        balance::set_total_shares(&env, total_shares - shares_to_remove);
+
+        let new_total_deposited = total_deposited
+            .checked_sub(amount_removed)
+            .ok_or(VaultError::ArithmeticError)?;
+        balance::set_total_deposited(&env, new_total_deposited);
+
+        if new_user_shares == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakedAtLedger(user.clone()));
+            let total_stakers = balance::get_total_stakers(&env);
+            if total_stakers > 0 {
+                balance::set_total_stakers(&env, total_stakers - 1);
+            }
+            events::position_closed(&env, &user);
+        }
+        Self::record_stake_snapshot(&env, &user, new_user_shares);
+
+        // store or merge unbonding position; restart cooldown from now
+        let current_ledger = env.ledger().sequence();
+        let mut existing: UnbondingPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()))
+            .unwrap_or(UnbondingPosition { amount: 0, unbonding_since: 0 });
+        let new_amount = existing.amount + amount_removed;
+        let new_pos = UnbondingPosition { amount: new_amount, unbonding_since: current_ledger };
+        env.storage()
+            .persistent()
+            .set(&DataKey::UnbondingPosition(user.clone()), &new_pos);
+
+        // advance reward checkpoint so no further rewards accrue to the removed shares
+        balance::set_reward_checkpoint_ledger(&env, &user, current_ledger);
+
+        // If cooldown == 0, optionally auto-execute withdrawal immediately
+        if cooldown == 0 {
+            // transfer tokens immediately
+            let token_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .ok_or(VaultError::NotInitialized)?;
+            let token_client = token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &user, &amount_removed);
+            // remove unbonding position since executed
+            env.storage().persistent().remove(&DataKey::UnbondingPosition(user.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Execute unstake after cooldown has passed. Transfers the pending unbonded amount to the user.
+    pub fn execute_unstake(env: Env, user: Address) -> Result<i128, VaultError> {
+        user.require_auth();
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        let pos_opt: Option<UnbondingPosition> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()));
+        let pos = match pos_opt {
+            Some(p) => p,
+            None => return Err(VaultError::PositionNotFound),
+        };
+        let current_ledger = env.ledger().sequence();
+        if cooldown > 0 {
+            let ready_ledger = pos.unbonding_since.saturating_add(cooldown);
+            if current_ledger < ready_ledger {
+                return Err(VaultError::UseCooldownFlow);
+            }
+        }
+
+        // transfer tokens to user and remove unbonding record
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &user, &pos.amount);
+
+        env.storage().persistent().remove(&DataKey::UnbondingPosition(user.clone()));
+
+        Ok(pos.amount)
+    }
+
+    /// Read-only: get pending unbonding position for a user
+    pub fn pending_unbonding(env: Env, user: Address) -> Result<Option<UnbondingPosition>, VaultError> {
+        let pos_opt: Option<UnbondingPosition> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UnbondingPosition(user.clone()));
+        Ok(pos_opt)
     }
 
     /// Query the current withdrawal limit per transaction.
@@ -748,6 +894,12 @@ impl VaultContract {
     fn do_unstake(env: &Env, staker: &Address, shares: i128) -> Result<i128, VaultError> {
         staker.require_auth();
         Self::require_not_paused(env)?;
+
+        // If cooldown is enabled, force use of request_unstake/execute_unstake flow
+        let cooldown: u32 = env.storage().instance().get(&DataKey::CooldownPeriod).unwrap_or(0);
+        if cooldown > 0 {
+            return Err(VaultError::UseCooldownFlow);
+        }
 
         if shares <= 0 {
             return Err(VaultError::ZeroAmount);
