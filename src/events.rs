@@ -75,3 +75,18 @@ pub fn claimed(env: &Env, user: &Address, reward: i128) {
     env.events()
         .publish(topics, (reward, env.ledger().sequence()));
 }
+
+/// Emitted by `initialize` so indexers can detect new pool deployments on-chain.
+pub fn pool_initialized(
+    env: &Env,
+    admin: &Address,
+    stake_token: &Address,
+    reward_token: &Address,
+    reward_rate_bps: u32,
+) {
+    let topics = (symbol_short!("init"),);
+    env.events().publish(
+        topics,
+        (admin.clone(), stake_token.clone(), reward_token.clone(), reward_rate_bps),
+    );
+}

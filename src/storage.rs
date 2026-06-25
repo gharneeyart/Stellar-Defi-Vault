@@ -6,7 +6,8 @@ use soroban_sdk::{contracttype, Address};
 /// MinStake, RewardRateBps, RewardPoolBalance, BoostSchedule, Paused,
 /// WithdrawalLimit, LockPeriod, EarlyExitPenaltyBps, TotalStakers,
 /// TotalRewardsPaid, SlashTreasury, WhitelistEnabled, CooldownPeriod,
-/// PoolCap, ClaimCap, ClaimCapWindow, StakeDecimals, RewardDecimals.
+/// PoolCap, ClaimCap, ClaimCapWindow, StakeDecimals, RewardDecimals,
+/// UnstakeFeeBps, AllStakers.
 ///
 /// Persistent keys (per-user, long-lived): ShareBalance, StakeHistory,
 /// RewardCheckpointLedger, LastClaimLedger, AccruedReward, StakedAtLedger,
@@ -57,6 +58,10 @@ pub enum DataKey {
     StakeDecimals,
     /// Decimal precision of the reward token (defaults to 7 when unset).
     RewardDecimals,
+    /// Fee charged on unstake in basis points, routed to reward treasury (max 500 bps).
+    UnstakeFeeBps,
+    /// Ordered list of all addresses with active staking positions. Used by get_total_claimable.
+    AllStakers,
 }
 
 #[contracttype]

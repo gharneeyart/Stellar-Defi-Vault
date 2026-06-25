@@ -28,4 +28,8 @@ pub enum VaultError {
     UseCooldownFlow = 19,
     /// Unstake fee exceeds the maximum allowed (500 bps / 5%).
     UnstakeFeeTooHigh = 20,
+    /// batch_position_query was called with more than 20 addresses.
+    BatchTooLarge = 21,
+    /// get_total_claimable was called when more than 200 stakers are registered.
+    TooManyStakers = 22,
 }

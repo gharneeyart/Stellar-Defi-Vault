@@ -288,6 +288,19 @@ pub fn set_reward_decimals(env: &Env, decimals: u32) {
         .set(&DataKey::RewardDecimals, &decimals);
 }
 
+// ── All-stakers list (issue #95) ──────────────────────────────────────────────
+
+pub fn get_all_stakers(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AllStakers)
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn set_all_stakers(env: &Env, stakers: &Vec<Address>) {
+    env.storage().instance().set(&DataKey::AllStakers, stakers);
+}
+
 // ── Share math ────────────────────────────────────────────────────────────────
 
 /// Convert a deposit amount to shares using current vault ratio.

@@ -51,6 +51,8 @@ impl VaultContract {
             &env,
             reward_decimals.unwrap_or(balance::DEFAULT_TOKEN_DECIMALS),
         );
+
+        events::pool_initialized(&env, &admin, &token, &token, 0);
         Ok(())
     }
 
@@ -148,6 +150,42 @@ impl VaultContract {
     /// Returns `None` when the user has no active position.
     pub fn position_of(env: Env, user: Address) -> Result<Option<StakePosition>, VaultError> {
         Self::build_position(&env, &user)
+    }
+
+    /// Returns positions for a list of addresses in a single contract call.
+    ///
+    /// Results are returned in the same order as the input list. `None` is returned
+    /// for users with no active position — the call never reverts on a missing user.
+    /// Reverts with `BatchTooLarge` when more than 20 addresses are supplied to prevent
+    /// excessive compute costs per invocation. No auth required.
+    pub fn batch_position_query(
+        env: Env,
+        users: Vec<Address>,
+    ) -> Result<Vec<Option<StakePosition>>, VaultError> {
+        if users.len() > 20 {
+            return Err(VaultError::BatchTooLarge);
+        }
+        let mut results = Vec::new(&env);
+        let mut i = 0;
+        while i < users.len() {
+            let user = users.get(i).unwrap();
+            results.push_back(Self::build_position(&env, &user)?);
+            i += 1;
+        }
+        Ok(results)
+    }
+
+    /// Returns the ledger at which the user's current reward accrual period started.
+    ///
+    /// Reads `last_claim_ledger` from the user's `StakePosition`. This value is reset
+    /// on every reward settlement (claim, stake top-up, or unstake), so it marks the
+    /// ledger from which rewards are currently accruing. Reverts with `PositionNotFound`
+    /// if the user has no active position.
+    pub fn claimable_since(env: Env, user: Address) -> Result<u32, VaultError> {
+        match Self::build_position(&env, &user)? {
+            Some(p) => Ok(p.last_claim_ledger),
+            None => Err(VaultError::PositionNotFound),
+        }
     }
 
     /// Read-only governance weight using the user's current staked shares.
@@ -397,6 +435,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(&env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(&env, &user);
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
@@ -817,6 +856,31 @@ impl VaultContract {
         ))
     }
 
+    // --- Total claimable (Issue #95) ---
+
+    /// Returns the sum of all pending rewards owed to active stakers at the current ledger.
+    ///
+    /// This is a read-only approximation — rewards keep accruing after the query returns.
+    /// Supports up to 200 registered stakers. Reverts with `TooManyStakers` beyond that
+    /// limit to prevent compute overflow. No auth required.
+    pub fn get_total_claimable(env: Env) -> Result<i128, VaultError> {
+        let _ = admin::get_admin(&env)?;
+        let all_stakers = balance::get_all_stakers(&env);
+        if all_stakers.len() > 200 {
+            return Err(VaultError::TooManyStakers);
+        }
+        let mut total: i128 = 0;
+        let mut i = 0;
+        while i < all_stakers.len() {
+            let user = all_stakers.get(i).unwrap();
+            let raw = Self::pending_reward(&env, &user)?;
+            let normalized = Self::normalize_to_reward_decimals(&env, raw)?;
+            total = total.checked_add(normalized).ok_or(VaultError::ArithmeticError)?;
+            i += 1;
+        }
+        Ok(total)
+    }
+
     // --- Pool statistics (#38) ---
 
     /// Aggregate pool statistics for frontend dashboards.
@@ -965,8 +1029,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(beneficiary.clone()), &current_ledger);
+            balance::set_last_claim_ledger(&env, &beneficiary, current_ledger);
             let total_stakers = balance::get_total_stakers(&env);
             balance::set_total_stakers(&env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(&env);
+            all_stakers.push_back(beneficiary.clone());
+            balance::set_all_stakers(&env, &all_stakers);
             events::position_opened(&env, &beneficiary, amount);
         }
         Self::record_stake_snapshot(&env, &beneficiary, new_shares);
@@ -977,12 +1045,14 @@ impl VaultContract {
     }
 
     /// Admin: slash a user's staked principal. Can be called while paused.
-    /// `admin_addr` must be the admin and is provided to follow existing patterns.
+    /// `admin_addr` must equal the stored admin address; mismatches return `Unauthorized`.
     /// Returns the actual slashed token amount.
     pub fn slash(env: Env, admin_addr: Address, user: Address, amount: i128) -> Result<i128, VaultError> {
-        // authorization: caller must be admin (enforced by require_admin)
-        admin::require_admin(&env)?;
-        // admin_addr is an argument (follows other admin methods) but we still check admin auth above
+        let stored_admin = admin::get_admin(&env)?;
+        if admin_addr != stored_admin {
+            return Err(VaultError::Unauthorized);
+        }
+        admin_addr.require_auth();
 
         if amount <= 0 {
             return Err(VaultError::ZeroAmount);
@@ -1043,6 +1113,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(&env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(&env, &user);
             events::position_closed(&env, &user);
         }
         Self::record_stake_snapshot(&env, &user, new_user_shares);
@@ -1179,6 +1250,20 @@ impl VaultContract {
 
     // --- Internal helpers ---
 
+    fn remove_from_staker_list(env: &Env, user: &Address) {
+        let stakers = balance::get_all_stakers(env);
+        let mut updated = Vec::new(env);
+        let mut i = 0;
+        while i < stakers.len() {
+            let s = stakers.get(i).unwrap();
+            if s != *user {
+                updated.push_back(s);
+            }
+            i += 1;
+        }
+        balance::set_all_stakers(env, &updated);
+    }
+
     fn do_stake(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
         staker.require_auth();
         Self::require_not_paused(env)?;
@@ -1243,8 +1328,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            balance::set_last_claim_ledger(env, staker, current_ledger);
             let total_stakers = balance::get_total_stakers(env);
             balance::set_total_stakers(env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(env);
+            all_stakers.push_back(staker.clone());
+            balance::set_all_stakers(env, &all_stakers);
             events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);
@@ -1367,6 +1456,7 @@ impl VaultContract {
             if total_stakers > 0 {
                 balance::set_total_stakers(env, total_stakers - 1);
             }
+            Self::remove_from_staker_list(env, staker);
             events::position_closed(env, staker);
         }
         Self::record_stake_snapshot(env, staker, new_user_shares);
@@ -1576,7 +1666,9 @@ impl VaultContract {
     /// token's decimal scale. When the reward token uses a different precision
     /// the value must be rescaled by the ratio of the two scales:
     ///
+    /// ```text
     ///     normalized = raw * 10^reward_decimals / 10^stake_decimals
+    /// ```
     ///
     /// To preserve precision and avoid spurious overflow this is applied as a
     /// single multiply or divide by `10^|reward_decimals - stake_decimals|`:
@@ -1806,8 +1898,12 @@ impl VaultContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            balance::set_last_claim_ledger(env, staker, current_ledger);
             let total_stakers = balance::get_total_stakers(env);
             balance::set_total_stakers(env, total_stakers + 1);
+            let mut all_stakers = balance::get_all_stakers(env);
+            all_stakers.push_back(staker.clone());
+            balance::set_all_stakers(env, &all_stakers);
             events::position_opened(env, staker, amount);
         }
         Self::record_stake_snapshot(env, staker, new_shares);

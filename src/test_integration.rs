@@ -422,8 +422,8 @@ fn test_position_of_returns_correct_fields() {
         "staked_at_ledger should match ledger at stake time"
     );
     assert_eq!(
-        position.last_claim_ledger, 0,
-        "last_claim_ledger should be 0 before any claim"
+        position.last_claim_ledger, 10,
+        "last_claim_ledger is initialised to the stake ledger when a position is opened"
     );
 }
 
@@ -1010,26 +1010,31 @@ fn test_no_rewards_accrued_during_cooldown() {
     let vault = VaultContractClient::new(&env, &vault_id);
     vault.initialize(&admin, &token_addr, &None, &None);
 
-    // set cooldown
     vault.set_cooldown_period(&10);
 
-    token_admin.mint(&alice, &500_000);
-    vault.stake(&alice, &100_000);
+    // Large principal ensures calc_pending_reward returns > 0 despite integer truncation
+    token_admin.mint(&alice, &10_000_000);
+    token_admin.mint(&admin, &1_000_000);
+    vault.stake(&alice, &10_000_000);
 
     // advance ledger to accrue some rewards
     env.ledger().with_mut(|li| li.sequence_number = 100);
     vault.set_reward_rate_bps(&1000);
 
     let pending_before = vault.calc_pending_reward(&alice);
-    assert!(pending_before > 0);
+    assert!(pending_before > 0, "pending_before must be > 0; got {}", pending_before);
 
-    // request unstake full amount
-    vault.request_unstake(&alice, &100_000);
+    // fund reward pool so claim() can transfer
+    vault.fund_reward_pool(&admin, &pending_before);
+
+    // request unstake full amount — settles rewards into AccruedReward at this ledger
+    vault.request_unstake(&alice, &10_000_000);
 
     // advance further during cooldown
     env.ledger().with_mut(|li| li.sequence_number = 200);
 
-    // claim should return only the accrued before request_unstake (no new accrual on unbonding principal)
+    // claim should return exactly the rewards accrued before request_unstake;
+    // no further rewards accrue on the unbonding principal (shares are 0)
     let claim_after = vault.claim(&alice);
     assert_eq!(claim_after, pending_before);
 }
