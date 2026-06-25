@@ -53,6 +53,8 @@ pub enum DataKey {
     ClaimCapWindow,
     /// Per-user running total of rewards claimed within the current window.
     UserClaimWindow(Address),
+    /// Per-user reward remainder (dust) from integer division.
+    RewardRemainder(Address),
 }
 
 #[contracttype]

@@ -174,7 +174,15 @@ See [docs/SECURITY.md](./docs/SECURITY.md) for the full security model, includin
 
 This contract is unaudited. Do not use in production without an independent security audit. If you find a vulnerability, please open a private [GitHub Security Advisory](../../security/advisories/new) rather than a public issue.
 
+## Known Limitations
+
+### Reward Rounding Dust Loss
+In fixed-point math, calculating reward using standard division leads to rounding loss where small stakes over short periods truncate to 0. Specifically:
+- **Without Remainder Tracking**: The reward dust is permanently lost on every checkpoint update (e.g., on stake, unstake, slash, or claim), as the division remainder is discarded. These tokens remain in the contract's general `RewardPoolBalance` but are unallocated and unrecoverable for the users.
+- **With Remainder Tracking**: The sub-unit reward remainder is persisted per-user and carried forward across checkpoints. It accumulates over time until it becomes a whole token unit, which is then claimable. If a user completely unstakes and closes their position permanently, any remaining sub-unit fraction (< 1 token unit) remains unclaimable in the contract, which is a standard limitation since the underlying token only supports integer transfers.
+
 ## License
 
 [MIT](./LICENSE)
 # Stellar-Defi-Vault
+

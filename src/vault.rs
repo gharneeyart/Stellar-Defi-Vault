@@ -1389,6 +1389,7 @@ impl VaultContract {
             current_shares,
             checkpoint,
             env.ledger().sequence(),
+            false,
         )?;
 
         accrued
@@ -1400,7 +1401,7 @@ impl VaultContract {
         let current_ledger = env.ledger().sequence();
         let checkpoint = balance::get_reward_checkpoint_ledger(env, user).unwrap_or(current_ledger);
         let additional_reward =
-            Self::reward_between_ledgers(env, user, current_shares, checkpoint, current_ledger)?;
+            Self::reward_between_ledgers(env, user, current_shares, checkpoint, current_ledger, true)?;
 
         if additional_reward > 0 {
             let accrued = balance::get_accrued_reward(env, user);
@@ -1420,6 +1421,7 @@ impl VaultContract {
         current_shares: i128,
         start_ledger: u32,
         end_ledger: u32,
+        persist: bool,
     ) -> Result<i128, VaultError> {
         if current_shares == 0 || end_ledger <= start_ledger {
             return Ok(0);
@@ -1440,7 +1442,7 @@ impl VaultContract {
         };
 
         let schedule = balance::get_boost_schedule(env).unwrap_or(Vec::new(env));
-        let mut reward: i128 = 0;
+        let mut total_dust: i128 = 0;
         let mut cursor = start_ledger;
         let mut current_multiplier =
             Self::multiplier_for_elapsed(schedule.clone(), cursor.saturating_sub(staked_at));
@@ -1460,13 +1462,14 @@ impl VaultContract {
                 break;
             }
 
-            reward = reward
-                .checked_add(Self::reward_for_ledgers(
-                    current_shares,
-                    rate_bps,
-                    current_multiplier,
-                    threshold - cursor,
-                )?)
+            let segment_dust = Self::reward_dust_for_ledgers(
+                current_shares,
+                rate_bps,
+                current_multiplier,
+                threshold - cursor,
+            )?;
+            total_dust = total_dust
+                .checked_add(segment_dust)
                 .ok_or(VaultError::ArithmeticError)?;
 
             cursor = threshold;
@@ -1474,16 +1477,69 @@ impl VaultContract {
             index += 1;
         }
 
-        reward = reward
-            .checked_add(Self::reward_for_ledgers(
-                current_shares,
-                rate_bps,
-                current_multiplier,
-                end_ledger - cursor,
-            )?)
+        let final_segment_dust = Self::reward_dust_for_ledgers(
+            current_shares,
+            rate_bps,
+            current_multiplier,
+            end_ledger - cursor,
+        )?;
+        total_dust = total_dust
+            .checked_add(final_segment_dust)
             .ok_or(VaultError::ArithmeticError)?;
 
+        let divisor = (BOOST_BPS_BASE as i128)
+            .checked_mul(STELLAR_LEDGERS_PER_YEAR as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let current_remainder = balance::get_reward_remainder(env, user);
+        let total_dust_with_remainder = total_dust
+            .checked_add(current_remainder)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let reward = total_dust_with_remainder
+            .checked_div(divisor)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let new_remainder = total_dust_with_remainder
+            .checked_rem(divisor)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        if persist {
+            balance::set_reward_remainder(env, user, new_remainder);
+        }
+
         Ok(reward)
+    }
+
+    /// Calculate reward dust (numerator before division by BOOST_BPS_BASE * STELLAR_LEDGERS_PER_YEAR).
+    ///
+    /// ROUNDING BEHAVIOR WARNING:
+    /// In traditional fixed-point math, calculating reward using standard division leads to severe
+    /// rounding loss where small stakes over short periods truncate to 0. For example, with an amount
+    /// of 100 shares, a rate of 100 bps (1%), and 300 elapsed ledgers, the reward calculation is:
+    /// reward = (100 * 100 * 300) / (10,000 * 6,307,200) = 3,000,000 / 63,072,000_000 = 0.
+    /// To mitigate this value loss, we track the sub-unit remainder (dust) per-user and carry it forward.
+    fn reward_dust_for_ledgers(
+        amount: i128,
+        rate_bps: u32,
+        multiplier_bps: u32,
+        elapsed_ledgers: u32,
+    ) -> Result<i128, VaultError> {
+        if elapsed_ledgers == 0 || amount == 0 {
+            return Ok(0);
+        }
+
+        let effective_rate_bps = (rate_bps as i128)
+            .checked_mul(multiplier_bps as i128)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_div(BOOST_BPS_BASE as i128)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        amount
+            .checked_mul(effective_rate_bps)
+            .ok_or(VaultError::ArithmeticError)?
+            .checked_mul(elapsed_ledgers as i128)
+            .ok_or(VaultError::ArithmeticError)
     }
 
     fn reward_for_ledgers(

@@ -1382,3 +1382,41 @@ fn test_cap_zero_disables_limit() {
     let window_opt = f.vault.get_claim_window(&f.alice);
     assert!(window_opt.is_none(), "no window stored when cap is disabled");
 }
+
+#[test]
+fn test_reward_rounding_to_zero_explicit() {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+    
+    // Set a very small rate: 100 bps (1% APR)
+    f.vault.set_reward_rate_bps(&100);
+
+    // Alice stakes a small amount: 2_000_000 shares
+    f.vault.stake(&f.alice, &2_000_000);
+
+    // Step 1: Advance by 300 ledgers
+    // Expected reward numerator without remainder:
+    // 2_000_000 shares * 100 bps * 300 ledgers = 60_000_000_000 dust.
+    // Divisor: 10_000 * 6_307_200 = 63_072_000_000.
+    // 60_000_000_000 / 63_072_000_000 = 0.
+    set_ledger(&f.env, 300);
+
+    // Pending reward is 0 because of truncation
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 0);
+
+    // Stake 1 token to trigger reward accrual and checkpoint update.
+    // This updates the user's checkpoint and commits the remainder to storage.
+    f.vault.stake(&f.alice, &1);
+
+    // Step 2: Advance by another 300 ledgers
+    // Expected reward numerator for this step:
+    // 2_000_001 shares * 100 bps * 300 ledgers = 60_000_030_000 dust.
+    // Cumulative dust with remainder: 60_000_000_000 + 60_000_030_000 = 120_000_030_000.
+    // Reward payout: 120_000_030_000 / 63_072_000_000 = 1.
+    set_ledger(&f.env, 600);
+
+    // With remainder tracking, the pending reward is now 1.
+    // Without remainder tracking, it would still be 0.
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 1);
+}
+
