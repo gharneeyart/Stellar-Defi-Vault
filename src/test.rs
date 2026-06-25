@@ -69,9 +69,9 @@ impl<'a> VaultFixture<'a> {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| {
-            li.min_temp_entry_ttl = 1_000_000;
-            li.min_persistent_entry_ttl = 1_000_000;
-            li.max_entry_ttl = 1_000_000;
+            li.min_temp_entry_ttl = 10_000_000;
+            li.min_persistent_entry_ttl = 10_000_000;
+            li.max_entry_ttl = 10_000_000;
         });
 
         let admin = Address::generate(&env);
@@ -983,7 +983,8 @@ fn test_pool_cap_updated_emits_event() {
         Address::try_from_val(&f.env, &event.1.get(1).unwrap()).unwrap(),
         f.admin
     );
-    assert_eq!(i128::try_from_val(&f.env, &event.2.get(0).unwrap()).unwrap(), 1_000_000);
+    let data = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&f.env, &event.2).unwrap();
+    assert_eq!(i128::try_from_val(&f.env, &data.get(0).unwrap()).unwrap(), 1_000_000);
 }
 
 #[test]
@@ -1173,4 +1174,211 @@ fn test_simulate_boost_impact_with_schedule() {
     let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &1000);
     assert_eq!(base, 1_000);
     assert!(boosted > base);
+}
+
+// ── get_pool_config (#76) ─────────────────────────────────────────────────────
+
+#[test]
+fn test_get_pool_config_returns_all_fields() {
+    let f = VaultFixture::new();
+    f.vault.set_reward_rate_bps(&500_u32);
+
+    let config = f.vault.get_pool_config();
+
+    assert_eq!(config.admin, f.admin);
+    // stake_token and reward_token are the same single-token vault token
+    assert_eq!(config.stake_token, config.reward_token);
+    assert_eq!(config.reward_rate_bps, 500_u32);
+    assert!(!config.paused);
+}
+
+#[test]
+fn test_get_pool_config_reflects_paused_state() {
+    let f = VaultFixture::new();
+    f.vault.pause();
+
+    let config = f.vault.get_pool_config();
+    assert!(config.paused);
+
+    f.vault.unpause();
+    let config2 = f.vault.get_pool_config();
+    assert!(!config2.paused);
+}
+
+// ── stake_and_claim (#77) ─────────────────────────────────────────────────────
+
+fn setup_reward_pool(f: &VaultFixture) {
+    f.token_admin.mint(&f.admin, &5_000_000);
+    f.vault.fund_reward_pool(&f.admin, &5_000_000);
+    f.vault.set_reward_rate_bps(&1000_u32); // 10% APR
+}
+
+#[test]
+fn test_stake_and_claim_with_pending_reward_settles_correctly() {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+
+    // Alice stakes at ledger 0
+    f.vault.stake(&f.alice, &1_000_000);
+
+    // Advance ledger so rewards accrue
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    let balance_before = f.token.balance(&f.alice);
+
+    // Alice stakes more and claims simultaneously
+    let claimed = f.vault.stake_and_claim(&f.alice, &500_000);
+
+    // Reward should be positive (10% APR × 1 year ≈ 100_000)
+    assert!(claimed > 0, "claimed reward must be positive");
+    // Alice's token balance should have decreased by 500_000 (new stake) minus the claimed reward
+    let balance_after = f.token.balance(&f.alice);
+    assert_eq!(balance_after, balance_before - 500_000 + claimed);
+}
+
+#[test]
+fn test_stake_and_claim_no_pending_reward_still_stakes() {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+
+    // Alice stakes at ledger 0 — no time elapses so no reward yet
+    f.vault.stake(&f.alice, &500_000);
+
+    let claimed = f.vault.stake_and_claim(&f.alice, &200_000);
+
+    assert_eq!(claimed, 0, "no reward should accrue within the same ledger");
+    // New stake should have been added: 500_000 + 200_000 = 700_000 shares
+    assert_eq!(f.vault.shares_of(&f.alice), 700_000);
+}
+
+#[test]
+fn test_stake_and_claim_emits_claimed_then_deposit_events() {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    f.vault.stake_and_claim(&f.alice, &500_000);
+
+    let events = f.env.events().all();
+    let mut found_claimed = false;
+    let mut found_deposit = false;
+    let mut claimed_index = usize::MAX;
+    let mut deposit_index = usize::MAX;
+
+    for (i, (_contract_id, topics, _data)) in events.iter().enumerate() {
+        if topic_matches(&f.env, &topics, "claimed") {
+            found_claimed = true;
+            claimed_index = i;
+        }
+        if topic_matches(&f.env, &topics, "deposit") {
+            found_deposit = true;
+            deposit_index = i;
+        }
+    }
+
+    assert!(found_claimed, "claimed event must be emitted");
+    assert!(found_deposit, "deposit (staked) event must be emitted");
+    assert!(
+        claimed_index < deposit_index,
+        "claimed event must precede deposit event"
+    );
+}
+
+#[test]
+fn test_stake_and_claim_new_stake_amount_added_correctly() {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+
+    // Alice opens a position first
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, 100);
+
+    let shares_before = f.vault.shares_of(&f.alice);
+
+    f.vault.stake_and_claim(&f.alice, &300_000);
+
+    let shares_after = f.vault.shares_of(&f.alice);
+    assert!(
+        shares_after > shares_before,
+        "share count must increase after stake_and_claim"
+    );
+}
+
+// ── set_claim_cap / get_claim_window (#78) ────────────────────────────────────
+
+fn setup_with_cap(cap: i128, window: u32) -> VaultFixture<'static> {
+    let f = VaultFixture::new();
+    setup_reward_pool(&f);
+    f.vault.set_claim_cap(&f.admin, &cap, &window);
+    f
+}
+
+#[test]
+fn test_claim_within_cap_succeeds_fully() {
+    let f = setup_with_cap(500_000, 100_000);
+
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    // Expected reward ≈ 100_000 (10% APR × 1M for 1 year), which is well under the 500_000 cap
+    let claimed = f.vault.claim(&f.alice);
+    assert!(claimed > 0, "claim within cap must return the full reward");
+
+    // Claimed amount must be fully reflected in claim window
+    let window = f.vault.get_claim_window(&f.alice).unwrap();
+    assert_eq!(window.claimed_in_window, claimed);
+}
+
+#[test]
+fn test_claim_exceeding_cap_is_truncated() {
+    // Cap at 50_000 — less than the expected ~100_000 reward for 1 year at 10% APR on 1M stake
+    let f = setup_with_cap(50_000, 100_000);
+
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    let claimed = f.vault.claim(&f.alice);
+    assert_eq!(claimed, 50_000, "claim must be truncated to the cap");
+
+    // Remainder should still be accrued — a second claim (same window) pays 0
+    let claimed2 = f.vault.claim(&f.alice);
+    assert_eq!(claimed2, 0, "no further claim allowed until window resets");
+}
+
+#[test]
+fn test_claim_window_resets_after_expiry() {
+    // Cap at 50_000, window = 100 ledgers
+    let f = setup_with_cap(50_000, 100);
+
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    // First claim exhausts the window
+    let first = f.vault.claim(&f.alice);
+    assert_eq!(first, 50_000);
+
+    // Jump past the window boundary
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR + 200);
+
+    // Second claim should be allowed again (window reset)
+    let second = f.vault.claim(&f.alice);
+    assert!(second > 0, "claim after window reset must succeed");
+}
+
+#[test]
+fn test_cap_zero_disables_limit() {
+    // Cap 0 = no limit
+    let f = setup_with_cap(0, 100_000);
+
+    f.vault.stake(&f.alice, &1_000_000);
+    set_ledger(&f.env, STELLAR_LEDGERS_PER_YEAR);
+
+    let claimed = f.vault.claim(&f.alice);
+    assert!(claimed > 0, "unlimited claim (cap=0) must return full reward");
+
+    // No ClaimWindow record should be written when cap is disabled
+    let window_opt = f.vault.get_claim_window(&f.alice);
+    assert!(window_opt.is_none(), "no window stored when cap is disabled");
 }

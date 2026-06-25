@@ -2,7 +2,7 @@ use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
 use crate::{
     admin, balance, errors::VaultError, events,
-    storage::{DataKey, PoolStats, StakePosition, UserStats},
+    storage::{ClaimWindow, DataKey, PoolConfig, PoolStats, StakePosition, UnbondingPosition, UserStats},
 };
 
 pub(crate) const CONTRACT_VERSION: &str = "0.1.0";
@@ -51,39 +51,39 @@ impl VaultContract {
     }
 
     /// Claim accumulated staking rewards without changing the staked position.
+    ///
+    /// Accrues any pending rewards up to the current ledger, then transfers the
+    /// full accrued balance to `staker`. If an admin-configured claim cap is
+    /// active the payout is limited to whatever headroom remains in the current
+    /// window; the remainder stays accrued and can be claimed in the next window.
+    ///
+    /// Returns the token amount transferred. Returns 0 if there is nothing to claim.
     pub fn claim(env: Env, staker: Address) -> Result<i128, VaultError> {
         staker.require_auth();
-        let current_shares = balance::get_shares(&env, &staker);
-        Self::accrue_rewards(&env, &staker, current_shares)?;
+        Self::do_claim(&env, &staker)
+    }
 
-        let reward = balance::get_accrued_reward(&env, &staker);
-        if reward == 0 {
-            balance::set_last_claim_ledger(&env, &staker, env.ledger().sequence());
-            return Ok(0);
-        }
+    /// Convenience function that claims pending rewards and adds a new stake
+    /// position in a single transaction, requiring only one user authorisation.
+    ///
+    /// Claim logic runs first so that any reward accrued on the existing stake
+    /// is settled before the new deposit changes the share ratio. The staking
+    /// logic then runs exactly as `stake` would. Events emitted in order:
+    /// `claimed` (reward amount) then `deposit` (new stake shares).
+    ///
+    /// Returns the reward amount paid out. Returns 0 if there was nothing to
+    /// claim before the stake was added.
+    pub fn stake_and_claim(env: Env, user: Address, amount: i128) -> Result<i128, VaultError> {
+        user.require_auth();
 
-        let reward_pool = balance::get_reward_pool_balance(&env);
-        if reward_pool < reward {
-            return Err(VaultError::InsufficientRewardPool);
-        }
+        // Settle pending rewards on the existing position first.
+        let claimed_amount = Self::do_claim(&env, &user)?;
 
-        let token_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(VaultError::NotInitialized)?;
+        // Stake the requested amount; do_stake_inner skips require_auth since
+        // the single auth above already covers both actions.
+        Self::do_stake_inner(&env, &user, amount)?;
 
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(&env.current_contract_address(), &staker, &reward);
-
-        balance::set_reward_pool_balance(&env, reward_pool - reward);
-        balance::set_accrued_reward(&env, &staker, 0);
-        balance::set_last_claim_ledger(&env, &staker, env.ledger().sequence());
-
-        let paid = balance::get_total_rewards_paid(&env);
-        balance::set_total_rewards_paid(&env, paid + reward);
-
-        Ok(reward)
+        Ok(claimed_amount)
     }
 
     /// Query share balance of a user.
@@ -517,6 +517,67 @@ impl VaultContract {
         Ok(balance::get_pool_cap(&env))
     }
 
+    /// Return all pool-level configuration in a single call.
+    ///
+    /// Reduces frontend RPC overhead by aggregating `admin`, `stake_token`,
+    /// `reward_token`, `reward_rate_bps`, and `paused` into one `PoolConfig`.
+    /// This is a pure read — no state is modified. Reverts with `NotInitialized`
+    /// if the contract has not yet been initialised.
+    pub fn get_pool_config(env: Env) -> Result<PoolConfig, VaultError> {
+        let admin = admin::get_admin(&env)?;
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+        let reward_rate_bps = balance::get_reward_rate_bps(&env);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        Ok(PoolConfig {
+            admin,
+            stake_token: token.clone(),
+            reward_token: token,
+            reward_rate_bps,
+            paused,
+        })
+    }
+
+    /// Admin: set the per-user reward claim cap and rolling window size.
+    ///
+    /// `max_amount` is the maximum cumulative reward any single user may claim
+    /// within a window of `window_ledgers` ledgers. Pass `0` for `max_amount`
+    /// to disable the cap entirely. The window resets automatically once
+    /// `current_ledger > window_started_at + window_ledgers`.
+    ///
+    /// Unclaimed remainder accrues into the next window — it is never lost.
+    pub fn set_claim_cap(
+        env: Env,
+        admin: Address,
+        max_amount: i128,
+        window_ledgers: u32,
+    ) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        let _ = admin; // argument follows existing admin patterns; auth enforced above
+        if max_amount < 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+        balance::set_claim_cap(&env, max_amount);
+        balance::set_claim_cap_window(&env, window_ledgers);
+        Ok(())
+    }
+
+    /// Read-only query: return the current claim window state for a user.
+    ///
+    /// Returns `None` when the user has never claimed or the cap is disabled.
+    /// Frontend can use this to show how much of the cap has been consumed and
+    /// when the window resets.
+    pub fn get_claim_window(env: Env, user: Address) -> Option<ClaimWindow> {
+        balance::get_user_claim_window(&env, &user)
+    }
+
     /// Admin: set the base reward APR in basis points.
     pub fn set_reward_rate_bps(env: Env, rate_bps: u32) -> Result<(), VaultError> {
         admin::require_admin(&env)?;
@@ -585,8 +646,8 @@ impl VaultContract {
         let mut index = 0;
         while index < history.len() {
             let (hist_ledger, hist_rate) = history.get(index).unwrap();
-            if *hist_ledger <= start_ledger {
-                rate_at_start = *hist_rate;
+            if hist_ledger <= start_ledger {
+                rate_at_start = hist_rate;
             } else {
                 break;
             }
@@ -596,15 +657,15 @@ impl VaultContract {
         // Now iterate through history entries within the window
         let mut last_ledger = start_ledger;
         let mut last_rate = rate_at_start;
-        
+
         while index < history.len() {
             let (hist_ledger, hist_rate) = history.get(index).unwrap();
-            if *hist_ledger < current_ledger {
+            if hist_ledger < current_ledger {
                 // Rate was last_rate from last_ledger to hist_ledger
                 let duration = hist_ledger - last_ledger;
                 weighted_sum += (duration as u64) * (last_rate as u64);
-                last_ledger = *hist_ledger;
-                last_rate = *hist_rate;
+                last_ledger = hist_ledger;
+                last_rate = hist_rate;
             } else {
                 break;
             }
@@ -1493,5 +1554,190 @@ impl VaultContract {
         } else {
             Ok(())
         }
+    }
+
+    // ── Inner claim helper (no require_auth) ──────────────────────────────────
+
+    /// Core claim logic shared by `claim` and `stake_and_claim`.
+    ///
+    /// Accrues rewards, applies the optional claim cap, transfers tokens, and
+    /// emits the `claimed` event. Does NOT call `require_auth` — callers are
+    /// responsible for gating access.
+    fn do_claim(env: &Env, staker: &Address) -> Result<i128, VaultError> {
+        let current_shares = balance::get_shares(env, staker);
+        Self::accrue_rewards(env, staker, current_shares)?;
+
+        let accrued = balance::get_accrued_reward(env, staker);
+        if accrued == 0 {
+            balance::set_last_claim_ledger(env, staker, env.ledger().sequence());
+            return Ok(0);
+        }
+
+        // Apply per-user claim cap if configured (issue #78).
+        let reward = Self::apply_claim_cap(env, staker, accrued)?;
+        if reward == 0 {
+            // Cap is exhausted for this window; nothing to pay out now.
+            balance::set_last_claim_ledger(env, staker, env.ledger().sequence());
+            return Ok(0);
+        }
+
+        let reward_pool = balance::get_reward_pool_balance(env);
+        if reward_pool < reward {
+            return Err(VaultError::InsufficientRewardPool);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let token_client = token::Client::new(env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), staker, &reward);
+
+        balance::set_reward_pool_balance(env, reward_pool - reward);
+        // Reduce accrued by the amount paid; cap-deferred remainder stays in accrued.
+        let remaining_accrued = accrued
+            .checked_sub(reward)
+            .ok_or(VaultError::ArithmeticError)?;
+        balance::set_accrued_reward(env, staker, remaining_accrued);
+        balance::set_last_claim_ledger(env, staker, env.ledger().sequence());
+
+        let paid = balance::get_total_rewards_paid(env);
+        balance::set_total_rewards_paid(env, paid + reward);
+
+        events::claimed(env, staker, reward);
+
+        Ok(reward)
+    }
+
+    // ── Inner stake helper (no require_auth) ──────────────────────────────────
+
+    /// Core stake logic shared by `do_stake` and `stake_and_claim`.
+    ///
+    /// Performs all the same side-effects as `do_stake` (pool cap check, share
+    /// minting, event emission) without calling `require_auth`. Callers must
+    /// have already authenticated the staker.
+    fn do_stake_inner(env: &Env, staker: &Address, amount: i128) -> Result<i128, VaultError> {
+        Self::require_not_paused(env)?;
+
+        let whitelist_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistEnabled)
+            .unwrap_or(false);
+        if whitelist_enabled {
+            let allowed = env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::Whitelisted(staker.clone()))
+                .unwrap_or(false);
+            if !allowed {
+                return Err(VaultError::NotWhitelisted);
+            }
+        }
+
+        if amount <= 0 {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(VaultError::NotInitialized)?;
+
+        let total_shares = balance::get_total_shares(env);
+        let total_deposited = balance::get_total_deposited(env);
+        let current_shares = balance::get_shares(env, staker);
+
+        Self::require_min_stake(env, current_shares, total_shares, total_deposited, amount)?;
+        Self::accrue_rewards(env, staker, current_shares)?;
+
+        let cap = balance::get_pool_cap(env);
+        if cap > 0 {
+            let new_total_deposited = total_deposited
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticError)?;
+            if new_total_deposited > cap {
+                return Err(VaultError::PoolCapReached);
+            }
+        }
+
+        let shares = balance::amount_to_shares(total_shares, total_deposited, amount)
+            .ok_or(VaultError::ArithmeticError)?;
+
+        let token_client = token::Client::new(env, &token_addr);
+        token_client.transfer(staker, &env.current_contract_address(), &amount);
+
+        let new_shares = current_shares + shares;
+        balance::set_shares(env, staker, new_shares);
+        balance::set_total_shares(env, total_shares + shares);
+        balance::set_total_deposited(env, total_deposited + amount);
+
+        let current_ledger = env.ledger().sequence();
+        if current_shares == 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakedAtLedger(staker.clone()), &current_ledger);
+            let total_stakers = balance::get_total_stakers(env);
+            balance::set_total_stakers(env, total_stakers + 1);
+            events::position_opened(env, staker, amount);
+        }
+        Self::record_stake_snapshot(env, staker, new_shares);
+
+        events::deposit(env, staker, amount, shares);
+
+        Ok(shares)
+    }
+
+    // ── Claim cap enforcement (issue #78) ─────────────────────────────────────
+
+    /// Apply the per-user rolling claim cap and return the payable reward.
+    ///
+    /// If the cap is disabled (max_amount == 0), returns `full_reward` unchanged.
+    /// Otherwise checks the user's `ClaimWindow`, resets it if the window has
+    /// expired, and returns `min(full_reward, remaining_headroom)`. The window
+    /// state is updated to reflect whatever will be paid out.
+    fn apply_claim_cap(env: &Env, user: &Address, full_reward: i128) -> Result<i128, VaultError> {
+        let max_amount = balance::get_claim_cap(env);
+        if max_amount == 0 {
+            return Ok(full_reward);
+        }
+
+        let window_ledgers = balance::get_claim_cap_window(env);
+        let current_ledger = env.ledger().sequence();
+
+        let mut window = balance::get_user_claim_window(env, user).unwrap_or(ClaimWindow {
+            claimed_in_window: 0,
+            window_started_at: current_ledger,
+        });
+
+        // Reset window if it has expired.
+        if window_ledgers > 0
+            && current_ledger > window.window_started_at.saturating_add(window_ledgers)
+        {
+            window = ClaimWindow {
+                claimed_in_window: 0,
+                window_started_at: current_ledger,
+            };
+        }
+
+        let headroom = max_amount
+            .checked_sub(window.claimed_in_window)
+            .unwrap_or(0)
+            .max(0);
+
+        let payable = full_reward.min(headroom);
+
+        if payable > 0 {
+            window.claimed_in_window = window
+                .claimed_in_window
+                .checked_add(payable)
+                .ok_or(VaultError::ArithmeticError)?;
+            balance::set_user_claim_window(env, user, &window);
+        }
+
+        Ok(payable)
     }
 }

@@ -239,8 +239,8 @@ fn test_whitelisted_user_can_stake_when_enabled() {
     vault.initialize(&admin, &token_addr);
 
     // enable whitelist and add alice
-    vault.set_whitelist_enabled(&admin, &true);
-    vault.add_to_whitelist(&admin, &alice);
+    vault.set_whitelist_enabled(&true);
+    vault.add_to_whitelist(&alice);
 
     token_admin.mint(&alice, &100_000);
     let res = vault.try_stake(&alice, &50_000);
@@ -261,7 +261,7 @@ fn test_non_whitelisted_user_rejected_when_enabled() {
     vault.initialize(&admin, &token_addr);
 
     // enable whitelist but do NOT add bob
-    vault.set_whitelist_enabled(&admin, &true);
+    vault.set_whitelist_enabled(&true);
 
     token_admin.mint(&bob, &100_000);
     let res = vault.try_stake(&bob, &20_000);
@@ -282,8 +282,8 @@ fn test_toggle_off_allows_non_whitelisted() {
     vault.initialize(&admin, &token_addr);
 
     // enable whitelist, but then turn it off
-    vault.set_whitelist_enabled(&admin, &true);
-    vault.set_whitelist_enabled(&admin, &false);
+    vault.set_whitelist_enabled(&true);
+    vault.set_whitelist_enabled(&false);
 
     token_admin.mint(&carol, &100_000);
     // should succeed when whitelist disabled
@@ -305,8 +305,8 @@ fn test_revocation_blocks_new_stake_but_allows_unstake_and_claim() {
     vault.initialize(&admin, &token_addr);
 
     // enable whitelist and add alice
-    vault.set_whitelist_enabled(&admin, &true);
-    vault.add_to_whitelist(&admin, &alice);
+    vault.set_whitelist_enabled(&true);
+    vault.add_to_whitelist(&alice);
 
     token_admin.mint(&alice, &200_000);
     // alice stakes 100k
@@ -317,7 +317,7 @@ fn test_revocation_blocks_new_stake_but_allows_unstake_and_claim() {
     vault.set_reward_rate_bps(&1000);
 
     // revoke alice
-    vault.remove_from_whitelist(&admin, &alice);
+    vault.remove_from_whitelist(&alice);
 
     // alice should NOT be able to stake more
     let try_more = vault.try_stake(&alice, &10_000);
@@ -736,7 +736,7 @@ fn test_slash_partial_and_treasury_receive() {
     vault.initialize(&admin, &token_addr);
 
     // set custom treasury
-    vault.set_slash_treasury(&admin, &treasury);
+    vault.set_slash_treasury(&treasury);
 
     // fund alice and stake
     token_admin.mint(&alice, &500_000);
@@ -747,7 +747,7 @@ fn test_slash_partial_and_treasury_receive() {
     assert_eq!(token.balance(&treasury), 0);
 
     // admin slashes 50_000
-    let slashed = vault.slash(&admin, &alice, &50_000).unwrap();
+    let slashed = vault.slash(&admin, &alice, &50_000);
     assert_eq!(slashed, 50_000);
 
     // alice position reduced accordingly (shares correspond to amounts on first stake)
@@ -775,13 +775,13 @@ fn test_slash_full_and_position_removed() {
     let vault_id = env.register_contract(None, VaultContract);
     let vault = VaultContractClient::new(&env, &vault_id);
     vault.initialize(&admin, &token_addr);
-    vault.set_slash_treasury(&admin, &treasury);
+    vault.set_slash_treasury(&treasury);
 
     token_admin.mint(&alice, &300_000);
     vault.stake(&alice, &150_000);
 
     // slash full or larger amount
-    let slashed = vault.slash(&admin, &alice, &200_000).unwrap();
+    let slashed = vault.slash(&admin, &alice, &200_000);
     assert_eq!(slashed, 150_000);
 
     // position removed
@@ -806,7 +806,7 @@ fn test_slash_works_while_paused() {
     let vault_id = env.register_contract(None, VaultContract);
     let vault = VaultContractClient::new(&env, &vault_id);
     vault.initialize(&admin, &token_addr);
-    vault.set_slash_treasury(&admin, &treasury);
+    vault.set_slash_treasury(&treasury);
 
     token_admin.mint(&alice, &200_000);
     vault.stake(&alice, &100_000);
@@ -815,7 +815,7 @@ fn test_slash_works_while_paused() {
     vault.pause();
 
     // should still be able to slash
-    let slashed = vault.slash(&admin, &alice, &30_000).unwrap();
+    let slashed = vault.slash(&admin, &alice, &30_000);
     assert_eq!(slashed, 30_000);
     assert_eq!(token.balance(&treasury), 30_000);
 }
@@ -863,7 +863,7 @@ fn test_reward_forfeiture_on_slash() {
     let vault_id = env.register_contract(None, VaultContract);
     let vault = VaultContractClient::new(&env, &vault_id);
     vault.initialize(&admin, &token_addr);
-    vault.set_slash_treasury(&admin, &treasury);
+    vault.set_slash_treasury(&treasury);
 
     token_admin.mint(&alice, &500_000);
     vault.stake(&alice, &100_000);
@@ -873,14 +873,14 @@ fn test_reward_forfeiture_on_slash() {
     vault.set_reward_rate_bps(&1000); // set a rate so rewards accrue
 
     // compute pending before slash (call claim would consume; we just simulate by checking pending)
-    let pending_before = vault.calc_pending_reward(&alice).unwrap();
+    let pending_before = vault.calc_pending_reward(&alice);
     assert!(pending_before > 0);
 
     // Slash user
-    vault.slash(&admin, &alice, &50_000).unwrap();
+    vault.slash(&admin, &alice, &50_000);
 
     // After slash, accrued rewards should be cleared; claim should return 0
-    let claim_after = vault.claim(&alice).unwrap();
+    let claim_after = vault.claim(&alice);
     assert_eq!(claim_after, 0);
 }
 
@@ -905,7 +905,7 @@ fn test_initialization_defaults_treasury_to_admin() {
     vault.stake(&alice, &20_000);
 
     // admin slashes -> funds should go to admin (default treasury)
-    vault.slash(&admin, &alice, &10_000).unwrap();
+    vault.slash(&admin, &alice, &10_000);
     assert_eq!(token.balance(&admin), 10_000);
 }
 
@@ -925,23 +925,23 @@ fn test_full_cooldown_flow() {
     vault.initialize(&admin, &token_addr);
 
     // set cooldown to 5 ledgers
-    vault.set_cooldown_period(&admin, &5);
+    vault.set_cooldown_period(&5);
 
     token_admin.mint(&alice, &200_000);
     vault.stake(&alice, &100_000);
 
     // request unstake 50_000
-    vault.request_unstake(&alice, &50_000).unwrap();
+    vault.request_unstake(&alice, &50_000);
 
     // pending unbonding should be present
-    let pos = vault.pending_unbonding(&alice).unwrap().unwrap();
+    let pos = vault.pending_unbonding(&alice).unwrap();
     assert_eq!(pos.amount, 50_000);
 
     // advance ledger past cooldown
     env.ledger().with_mut(|li| li.sequence_number = 6);
 
     // execute unstake
-    let executed = vault.execute_unstake(&alice).unwrap();
+    let executed = vault.execute_unstake(&alice);
     assert_eq!(executed, 50_000);
 
     // alice balance: minted 200k - staked 100k + executed 50k = 150k
@@ -961,11 +961,11 @@ fn test_premature_execute_unstake_fails() {
     let vault = VaultContractClient::new(&env, &vault_id);
     vault.initialize(&admin, &token_addr);
 
-    vault.set_cooldown_period(&admin, &10);
+    vault.set_cooldown_period(&10);
     token_admin.mint(&alice, &100_000);
     vault.stake(&alice, &50_000);
 
-    vault.request_unstake(&alice, &20_000).unwrap();
+    vault.request_unstake(&alice, &20_000);
 
     // attempt to execute immediately -> should fail
     let res = vault.try_execute_unstake(&alice);
@@ -986,7 +986,7 @@ fn test_zero_cooldown_bypass_allows_instant_unstake() {
     vault.initialize(&admin, &token_addr);
 
     // set cooldown to 0
-    vault.set_cooldown_period(&admin, &0);
+    vault.set_cooldown_period(&0);
 
     token_admin.mint(&alice, &100_000);
     vault.stake(&alice, &50_000);
@@ -1011,7 +1011,7 @@ fn test_no_rewards_accrued_during_cooldown() {
     vault.initialize(&admin, &token_addr);
 
     // set cooldown
-    vault.set_cooldown_period(&admin, &10);
+    vault.set_cooldown_period(&10);
 
     token_admin.mint(&alice, &500_000);
     vault.stake(&alice, &100_000);
@@ -1020,11 +1020,11 @@ fn test_no_rewards_accrued_during_cooldown() {
     env.ledger().with_mut(|li| li.sequence_number = 100);
     vault.set_reward_rate_bps(&1000);
 
-    let pending_before = vault.calc_pending_reward(&alice).unwrap();
+    let pending_before = vault.calc_pending_reward(&alice);
     assert!(pending_before > 0);
 
     // request unstake full amount
-    vault.request_unstake(&alice, &100_000).unwrap();
+    vault.request_unstake(&alice, &100_000);
 
     // advance further during cooldown
     env.ledger().with_mut(|li| li.sequence_number = 200);

@@ -1,5 +1,16 @@
 use soroban_sdk::{contracttype, Address};
 
+/// Storage keys for all persistent and instance state in the vault.
+///
+/// Instance keys (fast, small): Admin, Token, TotalShares, TotalDeposited,
+/// MinStake, RewardRateBps, RewardPoolBalance, BoostSchedule, Paused,
+/// WithdrawalLimit, LockPeriod, EarlyExitPenaltyBps, TotalStakers,
+/// TotalRewardsPaid, SlashTreasury, WhitelistEnabled, CooldownPeriod,
+/// PoolCap, ClaimCap, ClaimCapWindow.
+///
+/// Persistent keys (per-user, long-lived): ShareBalance, StakeHistory,
+/// RewardCheckpointLedger, LastClaimLedger, AccruedReward, StakedAtLedger,
+/// Delegate, Whitelisted, UnbondingPosition, UserClaimWindow.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -24,18 +35,24 @@ pub enum DataKey {
     TotalStakers,
     TotalRewardsPaid,
     Delegate(Address),
-    // Address that receives slashed tokens. Defaults to admin when not set.
+    /// Address that receives slashed tokens. Defaults to admin when not set.
     SlashTreasury,
-    // Whitelist flag and per-user whitelist mapping for permissioned pools
+    /// Whitelist flag and per-user whitelist mapping for permissioned pools.
     WhitelistEnabled,
     Whitelisted(Address),
-    // Cooldown period in ledgers for unbonding flow. 0 means instant unstake allowed.
+    /// Cooldown period in ledgers for unbonding flow. 0 means instant unstake allowed.
     CooldownPeriod,
-    // Per-user unbonding position stored when request_unstake is called.
+    /// Per-user unbonding position stored when request_unstake is called.
     UnbondingPosition(Address),
     PoolCap,
     // Rate change history: Vec<(ledger, rate_bps)> capped at 50 entries
     RateHistory,
+    /// Maximum reward claimable per user within a rolling ledger window (0 = disabled).
+    ClaimCap,
+    /// Window size in ledgers for the per-user claim cap.
+    ClaimCapWindow,
+    /// Per-user running total of rewards claimed within the current window.
+    UserClaimWindow(Address),
 }
 
 #[contracttype]
@@ -90,4 +107,38 @@ pub struct StakePosition {
     pub amount: i128,
     pub staked_at_ledger: u32,
     pub last_claim_ledger: u32,
+}
+
+/// Snapshot of all pool-level configuration returned by `get_pool_config`.
+///
+/// Allows frontends to fetch all settings in a single RPC call instead of
+/// querying each key individually.
+///
+/// - `admin`: current admin address.
+/// - `stake_token`: token accepted for staking and used to pay rewards.
+/// - `reward_token`: same as `stake_token` (single-token vault).
+/// - `reward_rate_bps`: annual reward rate in basis points.
+/// - `paused`: whether deposits and withdrawals are currently paused.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolConfig {
+    pub admin: Address,
+    pub stake_token: Address,
+    pub reward_token: Address,
+    pub reward_rate_bps: u32,
+    pub paused: bool,
+}
+
+/// Per-user reward claim window used to enforce the optional claim cap.
+///
+/// - `claimed_in_window`: cumulative rewards claimed by this user in the current window.
+/// - `window_started_at`: ledger sequence at which the current window began.
+///
+/// The window resets automatically when `current_ledger > window_started_at + window_ledgers`.
+/// Any unclaimed remainder is deferred to the next window — it is not lost.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimWindow {
+    pub claimed_in_window: i128,
+    pub window_started_at: u32,
 }

@@ -1,4 +1,4 @@
-use crate::storage::DataKey;
+use crate::storage::{ClaimWindow, DataKey};
 use soroban_sdk::{Address, Env, Vec};
 
 pub fn get_shares(env: &Env, user: &Address) -> i128 {
@@ -212,6 +212,40 @@ pub fn remove_delegate(env: &Env, user: &Address) {
         .persistent()
         .remove(&DataKey::Delegate(user.clone()));
 }
+
+// ── Claim cap (issue #78) ─────────────────────────────────────────────────────
+
+pub fn get_claim_cap(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::ClaimCap).unwrap_or(0)
+}
+
+pub fn set_claim_cap(env: &Env, cap: i128) {
+    env.storage().instance().set(&DataKey::ClaimCap, &cap);
+}
+
+pub fn get_claim_cap_window(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::ClaimCapWindow).unwrap_or(0)
+}
+
+pub fn set_claim_cap_window(env: &Env, window_ledgers: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ClaimCapWindow, &window_ledgers);
+}
+
+pub fn get_user_claim_window(env: &Env, user: &Address) -> Option<ClaimWindow> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserClaimWindow(user.clone()))
+}
+
+pub fn set_user_claim_window(env: &Env, user: &Address, window: &ClaimWindow) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserClaimWindow(user.clone()), window);
+}
+
+// ── Share math ────────────────────────────────────────────────────────────────
 
 /// Convert a deposit amount to shares using current vault ratio.
 /// First deposit: 1:1. Subsequent: proportional to existing pool.
