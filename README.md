@@ -66,6 +66,44 @@ cargo fmt --check
 cargo clippy --features testutils -- -D warnings
 ```
 
+### Deploying to Testnet
+
+To deploy the staking vault to Stellar Testnet and initialize it:
+
+1. **Deploy and Initialize**:
+   Run the deployment script. By default, it will generate a new deployment identity (`deployer`), fund it via Friendbot, build the optimized contract WASM, deploy the contract, deploy the native XLM wrapper contract (or resolve its existing ID), and initialize the vault.
+
+   ```bash
+   make deploy-testnet
+   ```
+
+   *Alternatively, you can customize the identity or network via environment variables:*
+   ```bash
+   IDENTITY=my-identity NETWORK=testnet make deploy-testnet
+   ```
+
+2. **Configure your Environment**:
+   The script will print configuration variables. Save them to a `.env` file in the project root:
+   ```env
+   CONTRACT_ID=CB...
+   TOKEN_ID=CD...
+   IDENTITY=my-identity
+   NETWORK=testnet
+   ```
+
+3. **Staking via CLI**:
+   Stake tokens into the vault (amount in raw units, e.g., 10 XLM = `100000000` stroops):
+   ```bash
+   make stake AMOUNT=100000000
+   ```
+
+4. **Claiming Rewards**:
+   Claim accrued rewards from the vault:
+   ```bash
+   make claim
+   ```
+
+
 ## Contract Interface
 
 | Function | Auth Required | Description |
