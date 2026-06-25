@@ -325,3 +325,17 @@ pub fn shares_to_amount(total_shares: i128, total_deposited: i128, shares: i128)
             .checked_div(total_shares)
     }
 }
+
+pub fn get_reward_remainder(env: &Env, user: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::RewardRemainder(user.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_reward_remainder(env: &Env, user: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::RewardRemainder(user.clone()), &amount);
+}
+

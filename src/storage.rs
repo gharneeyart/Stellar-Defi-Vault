@@ -60,14 +60,8 @@ pub enum DataKey {
     ClaimCapWindow,
     /// Per-user running total of rewards claimed within the current window.
     UserClaimWindow(Address),
-    /// Decimal precision of the stake token (defaults to 7 when unset).
-    StakeDecimals,
-    /// Decimal precision of the reward token (defaults to 7 when unset).
-    RewardDecimals,
-    /// Fee charged on unstake in basis points, routed to reward treasury (max 500 bps).
-    UnstakeFeeBps,
-    /// Ordered list of all addresses with active staking positions. Used by get_total_claimable.
-    AllStakers,
+    /// Per-user reward remainder (dust) from integer division.
+    RewardRemainder(Address),
 }
 
 #[contracttype]
