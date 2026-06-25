@@ -2,6 +2,10 @@
 
 Thank you for your interest in contributing! This project is part of the **Stellar Wave Program** on Drips. All contributions that resolve tagged issues during an active Wave are eligible for rewards.
 
+## Full Contributor Guide
+
+For a detailed walkthrough — including environment setup, architecture overview, a worked example PR, and common mistakes — see **[docs/CONTRIBUTING_GUIDE.md](docs/CONTRIBUTING_GUIDE.md)**.
+
 ## Getting Started
 
 ### Prerequisites
