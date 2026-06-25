@@ -68,3 +68,20 @@ pub fn slash(env: &Env, admin: &Address, user: &Address, amount: i128) {
     env.events()
         .publish(topics, (user.clone(), amount, env.ledger().sequence()));
 }
+
+pub fn position_transferred(env: &Env, from: &Address, to: &Address, amount: i128) {
+    let topics = (symbol_short!("pos_xfer"), from);
+    env.events()
+        .publish(topics, (to.clone(), amount, env.ledger().sequence()));
+}
+
+pub fn campaign_started(env: &Env, admin: &Address, multiplier_bps: u32, ends_at_ledger: u32) {
+    let topics = (symbol_short!("camp_on"), admin);
+    env.events()
+        .publish(topics, (multiplier_bps, ends_at_ledger, env.ledger().sequence()));
+}
+
+pub fn campaign_ended(env: &Env, admin: &Address) {
+    let topics = (symbol_short!("camp_off"), admin);
+    env.events().publish(topics, (env.ledger().sequence(),));
+}

@@ -26,4 +26,12 @@ pub enum VaultError {
     NotWhitelisted = 18,
     /// Unstake must use request_unstake / execute_unstake flow when cooldown is enabled.
     UseCooldownFlow = 19,
+    /// Recipient already has an active staking position.
+    RecipientAlreadyStaking = 20,
+    /// A boost campaign is already active; end it before starting a new one.
+    CampaignAlreadyActive = 21,
+    /// No boost campaign is currently active.
+    NoCampaignActive = 22,
+    /// Leaderboard size exceeds the maximum of 20.
+    LeaderboardSizeTooLarge = 23,
 }
